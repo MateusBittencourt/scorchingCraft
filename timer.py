@@ -26,10 +26,6 @@ class Timer(threading.Thread):
                 # Reset was triggered, clear the event and continue
                 self.reset_event.clear()
 
-    # This function starts the timer
-    def start(self):
-        self.run()
-
     # This function stops the timer
     def stop(self):
         self.stop_event.set()
