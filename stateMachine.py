@@ -15,64 +15,16 @@ class StateMachine():
         match event.messageType:
             case MessageType.EVENT:
                 match event.type:
-                    case EventType.HEARTBEAT:
+                    case EventType.INIT:
                         return FollowerState(self.raft_node)
         return self
     
     def init_class(self):
         event = {
-            "type": EventType.HEARTBEAT,
+            "type": EventType.INIT,
             "messageType": MessageType.EVENT
         }
         self.proxy_call(self.raft_node.uri, event)
-    
-    def heartbeat (self, event_data):
-        if event_data.term >= self.raft_node.term:
-            try:
-                self.heartbeat_timer.reset()
-            except AttributeError:
-                pass
-            try:
-                self.heartbeat_scheduler.stop()
-            except AttributeError:
-                pass
-            try:
-                self.stop_election_countdown()
-            except AttributeError:
-                pass
-            if event_data.leader != self.raft_node.leader or event_data.term != self.raft_node.term:
-                self.raft_node.leader = event_data.leader
-                self.raft_node.term = event_data.term
-                if (self.raft_node.current_state() != FollowerState):
-                    return FollowerState(self.raft_node)
-        return self
-    
-    def vote(self, event_data):
-        print(f"{self.raft_node.name} received vote request from {event_data.candidate}")
-        if event_data.term > self.raft_node.term:
-            try:
-                self.stop_election_countdown()
-            except AttributeError:
-                pass
-            try:
-                self.heartbeat_scheduler.stop()
-            except AttributeError:
-                pass
-            self.raft_node.term = event_data.term
-            self.raft_node.leader = event_data.candidate
-            reply = {
-                "type": EventType.VOTE,
-                "messageType": MessageType.REPLY,
-                "data": {
-                    "uri": str(self.raft_node.uri),
-                    "term": self.raft_node.term,
-                    "voter": self.raft_node.name
-                }
-            }
-            self.proxy_call(str(event_data.uri), reply)
-            if (self.raft_node.current_state() != FollowerState):
-                return FollowerState(self.raft_node)
-        return self
 
     def proxy_call(self, uri, event):
         proxy_thread = Thread(target=self.raft_node.proxy_call, args=(uri, event))
@@ -87,13 +39,14 @@ class LeaderState(StateMachine):
         super().__init__(raft_node)
         print(f"{self.raft_node.name} became leader")
         
+        self.append_confirmation = {}
+        self.append_waiting = {}
+        
         self.heartbeat_scheduler = Timer(HEARTBEAT_INTERVAL, self.send_heartbeat, continuous=True)
         self.heartbeat_scheduler.start()
         
-        # self.raft_node.name_server.register(f"Leader.Term-{self.raft_node.term}", self.raft_node.uri)
-        self.locate_ns_thread = Thread(target=self.register_ns)
-        self.locate_ns_thread.daemon = True
-        self.locate_ns_thread.start()
+        self.name_ns = f"Leader.Term-{self.raft_node.term}"
+        self.raft_node.name_server.register(self.name_ns, self.raft_node.uri)
         
     def on_event(self, event):
         match event.messageType:
@@ -110,6 +63,29 @@ class LeaderState(StateMachine):
                     case EventType.APPEND_ENTRIES:
                         self.append_entries_reply(event.data)
         return self
+    
+    def heartbeat (self, event_data):
+        if event_data.term >= self.raft_node.term:
+            self.heartbeat_timer.reset()
+            if event_data.leader != self.raft_node.leader or event_data.term != self.raft_node.term:
+                self.raft_node.leader = event_data.leader
+                self.raft_node.term = event_data.term
+                
+    def vote(self, event_data):
+        # print(f"{self.raft_node.name} received vote request from {event_data.candidate}")
+        if event_data.term > self.raft_node.term:
+            self.raft_node.term = event_data.term
+            self.raft_node.leader = event_data.candidate
+            reply = {
+                "type": EventType.VOTE,
+                "messageType": MessageType.REPLY,
+                "data": {
+                    "voter": self.raft_node.name,
+                    "uri": str(self.raft_node.uri),
+                    "term": self.raft_node.term
+                }
+            }
+            self.proxy_call(str(event_data.uri), reply)
 
     def append_entries(self, event_data):
         print(f"{self.raft_node.name} received append entries from client {event_data.client}")
@@ -130,11 +106,35 @@ class LeaderState(StateMachine):
                 "previous_log": self.raft_node.log[-1]
             }
         }
+        self.append_waiting[event_data.log.id] = event_data.log
+        self.append_confirmation[event_data.log.id] = 1
         for node in self.raft_node.nodes:
             self.proxy_call(str(node.uri), event)
     
     def append_entries_reply(self, event_data):
-        print(f"{self.raft_node.name} received append entries reply from {event_data.leader}")
+        print(f"{self.raft_node.name} received append entries reply from {event_data.node}")
+        if event_data.logId in self.append_waiting:
+            if event_data.status == "consistent":
+                self.append_confirmation[event_data.logId] += 1
+            if self.append_confirmation[event_data.logId] > len(self.raft_node.nodes) + 1 / 2:
+                self.raft_node.log.append(self.append_waiting[event_data.logId])
+                self.append_waiting.pop(event_data.logId)
+                self.append_confirmation.pop(event_data.logId)
+
+                event = {
+                    "type": EventType.COMMIT_ENTRIES,
+                    "messageType": MessageType.EVENT,
+                    "data": {
+                        "leader": self.raft_node.name,
+                        "uri": str(self.raft_node.uri),
+                        "term": self.raft_node.term,
+                        "logId": event_data.logId
+                    }
+                }
+                
+                for node in self.raft_node.nodes:
+                    self.proxy_call(str(node.uri), event)
+        
     
     def send_heartbeat(self):
         event = {
@@ -149,11 +149,6 @@ class LeaderState(StateMachine):
         for node in self.raft_node.nodes:
             # print(f"{self.raft_node.name} sending heartbeat to {node.name}")
             self.proxy_call(str(node.uri), event)
-
-    def register_ns(self):
-        name = f"Leader.Term-{self.raft_node.term}"
-        print(f"Registering leader {self.raft_node.name} as {name}")
-        Pyro5.api.locate_ns().register(name, self.raft_node.uri)
 
 class CandidateState(StateMachine):
     def __init__(self, raft_node):
@@ -172,6 +167,35 @@ class CandidateState(StateMachine):
                 match event.type:
                     case EventType.VOTE:
                         return self.receive_vote(event.data)
+        return self
+    
+    def heartbeat (self, event_data):
+        if event_data.term >= self.raft_node.term:
+            self.stop_election_countdown()
+            self.raft_node.leader = event_data.leader
+            self.raft_node.term = event_data.term
+            print(f"{self.raft_node.name} who is a candidate received heartbeat from {event_data.leader}")
+            return FollowerState(self.raft_node)
+        return self
+    
+    def vote(self, event_data):
+        # print(f"{self.raft_node.name} received vote request from {event_data.candidate}")
+        if event_data.term > self.raft_node.term:
+            self.stop_election_countdown()
+            self.raft_node.term = event_data.term
+            self.raft_node.leader = event_data.candidate
+            reply = {
+                "type": EventType.VOTE,
+                "messageType": MessageType.REPLY,
+                "data": {
+                    "voter": self.raft_node.name,
+                    "uri": str(self.raft_node.uri),
+                    "term": self.raft_node.term
+                }
+            }
+            self.proxy_call(str(event_data.uri), reply)
+            return FollowerState(self.raft_node)
+        self.election_countdown()
         return self
 
     def election_countdown(self):
@@ -236,7 +260,7 @@ class FollowerState(StateMachine):
         print(f"{self.raft_node.name} became follower")
         self.heartbeat_timer = Timer(HEARTBEAT_TIMEOUT, self.timeout_event)
         self.heartbeat_timer.start()
-        self.waiting_log = {}
+        self.append_waiting = {}
         
     def on_event(self, event):
         match event.messageType:
@@ -246,16 +270,37 @@ class FollowerState(StateMachine):
                         self.heartbeat(event.data)
                     case EventType.VOTE:
                         self.vote(event.data)
+                    case EventType.APPEND_ENTRIES:
+                        self.append_entries(event.data)
+                    case EventType.COMMIT_ENTRIES:
+                        self.commit_entries(event.data)
                     case EventType.TIMEOUT:
                         self.heartbeat_timer.stop()
                         return CandidateState(self.raft_node)
-                    case EventType.APPEND_ENTRIES:
-                        self.append_entries(event.data)
-            case MessageType.REPLY:
-                match event.type:
-                    case EventType.APPEND_ENTRIES:
-                        self.append_entries_reply(event.data)
         return self
+    
+    def heartbeat (self, event_data):
+        if event_data.term >= self.raft_node.term:
+            self.heartbeat_timer.reset()
+            if event_data.leader != self.raft_node.leader or event_data.term != self.raft_node.term:
+                self.raft_node.leader = event_data.leader
+                self.raft_node.term = event_data.term
+    
+    def vote(self, event_data):
+        # print(f"{self.raft_node.name} received vote request from {event_data.candidate}")
+        if event_data.term > self.raft_node.term:
+            self.raft_node.term = event_data.term
+            self.raft_node.leader = event_data.candidate
+            reply = {
+                "type": EventType.VOTE,
+                "messageType": MessageType.REPLY,
+                "data": {
+                    "voter": self.raft_node.name,
+                    "uri": str(self.raft_node.uri),
+                    "term": self.raft_node.term
+                }
+            }
+            self.proxy_call(str(event_data.uri), reply)
     
     def timeout_event (self):
         print(f"{self.raft_node.name} timed out")
@@ -268,11 +313,11 @@ class FollowerState(StateMachine):
     def append_entries(self, event_data):
         print(f"{self.raft_node.name} received append entries from leader {event_data.leader}")                            
         previous_log = self.raft_node.log[-1]
-        if event_data.previous_log != previous_log:
+        if previous_log != None and event_data.previous_log != previous_log:
             print(f"{self.raft_node.name} log is inconsistent with leader's log")
             status = "inconsistent"
         else:
-            self.waiting_log["id"] = event_data.log
+            self.append_waiting[event_data.log.id] = event_data.log
             status = "consistent"
         reply = {
             "type": EventType.APPEND_ENTRIES,
@@ -280,7 +325,13 @@ class FollowerState(StateMachine):
             "data": {
                 "node": self.raft_node.name,
                 "uri": str(self.raft_node.uri),
-                "status": status
+                "status": status,
+                "logId": event_data.log.id
             }
         }
         self.proxy_call(str(event_data.uri), reply)
+    
+    def commit_entries(self, event_data):
+        print(f"{self.raft_node.name} committing entries")
+        self.raft_node.log.append(self.append_waiting[event_data.logId])
+        self.append_waiting.pop(event_data.logId)

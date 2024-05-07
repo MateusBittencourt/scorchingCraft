@@ -3,18 +3,15 @@ import Pyro5.api
 import Pyro5.server
 from threading import Thread
 from multicast import MulticastService
-from random import randrange
 from dotmap import DotMap
 from stateMachine import StateMachine
 from typeEnums import MessageType, EventType
-from variables import PYRO_ID
 
 ############################################################################################
 # Class that represents the Pyro5 node
 @Pyro5.api.expose
 class RaftNode(object):
-    def __init__(self, id):
-        self.name = f"{PYRO_ID}.{id}"
+    def __init__(self):
         self.votes = 0
         self.log = []
         
@@ -27,6 +24,7 @@ class RaftNode(object):
         
         self.daemon = Pyro5.api.Daemon()
         self.uri = self.daemon.register(self)
+        self.name = self.uri.object
                 
         # Start the multicast listener on a separate thread
         self.multicast_service = MulticastService(self.update_nodes)
@@ -35,7 +33,7 @@ class RaftNode(object):
         self.receive_thread.start()
 
         # Send node info using multicast service
-        self.multicast_service.send_multicast({"nodes": [{"name": self.name, "uri": str(self.uri)}], "type": "new_node", "name": self.name})
+        self.multicast_service.send_multicast({"data": {"name": self.name, "uri": str(self.uri)}, "eventType": "new_node"})
         
         # Initialize the state machine
         self.init_state()
@@ -60,17 +58,13 @@ class RaftNode(object):
         return self.state
     
     def update_nodes(self, reply):
-        # print(f"Received nodes update: {reply}")
+        # print(f"Received node list update: {reply}")
         reply = DotMap(reply)
-        for node in reply.nodes:
-            if node not in self.nodes and node.name != self.name:
-                self.nodes.append(node)
-        if reply.type == "new_node" and reply.name != self.name:
-            nodes_temp = []
-            for node in self.nodes:
-                nodes_temp.append(node.toDict())
-            nodes_temp.append({"name": self.name, "uri": str(self.uri)})
-            self.multicast_service.send_multicast({"nodes": nodes_temp, "type": "update_nodes", "name": self.name})
+        if reply.data not in self.nodes and reply.data.name != self.name:
+            # print(f"Adding node {reply.data.name} to list")
+            self.nodes.append(reply.data)
+        if reply.eventType == "new_node" and reply.data.name != self.name:
+            self.multicast_service.send_multicast({"data": {"name": self.name, "uri": str(self.uri)}, "eventType": "update_nodes"})
     
     def proxy_call(self, uri, event):
         node_proxy = Pyro5.api.Proxy(uri)
@@ -83,4 +77,4 @@ class RaftNode(object):
     
 
 if __name__ == "__main__":
-    node = RaftNode(randrange(3000))
+    node = RaftNode()
