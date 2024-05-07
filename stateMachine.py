@@ -3,6 +3,8 @@ import Pyro5.api
 import Pyro5.server
 from random import randrange
 from threading import Thread
+
+from dotmap import DotMap
 from timer import Timer
 from typeEnums import MessageType, EventType
 from variables import HEARTBEAT_TIMEOUT, HEARTBEAT_INTERVAL
@@ -39,14 +41,15 @@ class LeaderState(StateMachine):
         super().__init__(raft_node)
         print(f"{self.raft_node.name} became leader")
         
-        self.append_confirmation = {}
-        self.append_waiting = {}
+        self.append_confirmation = DotMap()
+        self.append_waiting = DotMap()
         
         self.heartbeat_scheduler = Timer(HEARTBEAT_INTERVAL, self.send_heartbeat, continuous=True)
         self.heartbeat_scheduler.start()
         
-        self.name_ns = f"Leader.Term-{self.raft_node.term}"
-        self.raft_node.name_server.register(self.name_ns, self.raft_node.uri)
+        self.locate_ns_thread = Thread(target=self.register_ns)
+        self.locate_ns_thread.daemon = True
+        self.locate_ns_thread.start()
         
     def on_event(self, event):
         match event.messageType:
@@ -89,38 +92,59 @@ class LeaderState(StateMachine):
 
     def append_entries(self, event_data):
         print(f"{self.raft_node.name} received append entries from client {event_data.client}")
+        if len(self.raft_node.log) == 0:
+            previous_log = None
+        else:
+            previous_log = self.raft_node.log[-1]
+        
+        log = {
+            "id": event_data.id,
+            "client": event_data.client,
+            "data": {
+                "operation": event_data.data.operation,
+                "arguments": event_data.data.arguments,
+                "success": event_data.data.success
+            },
+            "date": event_data.date,
+            "term": self.raft_node.term
+        }
+        
         event = {
             "type": EventType.APPEND_ENTRIES,
             "messageType": MessageType.EVENT,
             "data": {
                 "leader": self.raft_node.name,
-                "uri": str(self.raft_node.uri),
+                "uri": self.raft_node.uri,
                 "term": self.raft_node.term,
-                "log": {
-                    "id": event_data.id,
-                    "client": event_data.client,
-                    "data": event_data.data,
-                    "date": event_data.date,
-                    "term": self.raft_node.term
-                },
-                "previous_log": self.raft_node.log[-1]
+                "log": log,
+                "previous_log": previous_log
             }
         }
-        self.append_waiting[event_data.log.id] = event_data.log
-        self.append_confirmation[event_data.log.id] = 1
+        
+        self.append_waiting[event_data.id] = log
+        self.append_confirmation[event_data.id] = 0
         for node in self.raft_node.nodes:
-            self.proxy_call(str(node.uri), event)
+            print(f"{self.raft_node.name} sending append entries to {node.name}")
+            self.proxy_call(node.uri, event)
+            print(f"{self.raft_node.name} sent append entries to {node.name}")
+        self.check_append_entries_reply(event_data.id, "consistent")
     
     def append_entries_reply(self, event_data):
         print(f"{self.raft_node.name} received append entries reply from {event_data.node}")
-        if event_data.logId in self.append_waiting:
-            if event_data.status == "consistent":
-                self.append_confirmation[event_data.logId] += 1
-            if self.append_confirmation[event_data.logId] > len(self.raft_node.nodes) + 1 / 2:
-                self.raft_node.log.append(self.append_waiting[event_data.logId])
-                self.append_waiting.pop(event_data.logId)
-                self.append_confirmation.pop(event_data.logId)
-
+        self.check_append_entries_reply(event_data.logId, event_data.status)
+    
+    def check_append_entries_reply(self, logId, status):
+        if logId in self.append_waiting:
+            if status == "consistent":
+                self.append_confirmation[logId] += 1
+            if self.append_confirmation[logId] > len(self.raft_node.nodes) + 1 / 2:
+                self.raft_node.log.append(self.append_waiting[logId])
+                
+                print(f"{self.raft_node.name} log is now {self.raft_node.log}")
+                
+                self.append_waiting.pop(logId)
+                self.append_confirmation.pop(logId)
+                
                 event = {
                     "type": EventType.COMMIT_ENTRIES,
                     "messageType": MessageType.EVENT,
@@ -128,7 +152,7 @@ class LeaderState(StateMachine):
                         "leader": self.raft_node.name,
                         "uri": str(self.raft_node.uri),
                         "term": self.raft_node.term,
-                        "logId": event_data.logId
+                        "logId": logId
                     }
                 }
                 
@@ -149,6 +173,15 @@ class LeaderState(StateMachine):
         for node in self.raft_node.nodes:
             # print(f"{self.raft_node.name} sending heartbeat to {node.name}")
             self.proxy_call(str(node.uri), event)
+            
+    def register_ns(self):
+        name = f"Leader.Term-{self.raft_node.term}"
+        metadata = {
+            "Leader" : "",
+            f"{self.raft_node.term}" : "" 
+        }
+        print(f"Registering leader {self.raft_node.name}")
+        Pyro5.api.locate_ns().register(name, self.raft_node.uri, metadata=metadata)
 
 class CandidateState(StateMachine):
     def __init__(self, raft_node):
@@ -162,6 +195,10 @@ class CandidateState(StateMachine):
                 match event.type:
                     case EventType.VOTE:
                         return self.vote(event.data)
+                    case EventType.HEARTBEAT:
+                        return self.heartbeat(event.data)
+                    case EventType.APPEND_ENTRIES:
+                        self.append_entries(event.data)
                         
             case MessageType.REPLY: 
                 match event.type:
@@ -250,7 +287,11 @@ class CandidateState(StateMachine):
             self.stop_election_countdown()
             return LeaderState(self.raft_node)
         return self
-
+    
+    def append_entries(self, event_data):
+        print(f"{self.raft_node.name} received append entries while in candidate state")
+        
+    
 ####################################################################################################
 # Follower State
 ####################################################################################################
@@ -260,7 +301,7 @@ class FollowerState(StateMachine):
         print(f"{self.raft_node.name} became follower")
         self.heartbeat_timer = Timer(HEARTBEAT_TIMEOUT, self.timeout_event)
         self.heartbeat_timer.start()
-        self.append_waiting = {}
+        self.append_waiting = DotMap()
         
     def on_event(self, event):
         match event.messageType:
@@ -312,8 +353,11 @@ class FollowerState(StateMachine):
     
     def append_entries(self, event_data):
         print(f"{self.raft_node.name} received append entries from leader {event_data.leader}")                            
-        previous_log = self.raft_node.log[-1]
-        if previous_log != None and event_data.previous_log != previous_log:
+        if len(self.raft_node.log) == 0:
+            previous_log = None
+        else:
+            previous_log = self.raft_node.log[-1]
+        if event_data.previous_log != previous_log:
             print(f"{self.raft_node.name} log is inconsistent with leader's log")
             status = "inconsistent"
         else:
@@ -335,3 +379,4 @@ class FollowerState(StateMachine):
         print(f"{self.raft_node.name} committing entries")
         self.raft_node.log.append(self.append_waiting[event_data.logId])
         self.append_waiting.pop(event_data.logId)
+        print(f"{self.raft_node.name} log is now {self.raft_node.log}")

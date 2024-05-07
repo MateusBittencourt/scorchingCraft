@@ -1,6 +1,8 @@
 import Pyro5.core
 import Pyro5.api
 import Pyro5.server
+import uuid
+from datetime import datetime
 from threading import Thread
 from multicast import MulticastService
 from dotmap import DotMap
@@ -43,12 +45,36 @@ class RaftNode(object):
         
     # This function is called when a new event is received
     def on_event(self, event):
-        # print(f"{self.name} received event {event}")
+        # if event["type"] != 1:
+        #     print(f"{self.name} received event {event}")
         event = DotMap(event)
         event.type = EventType(event.type)
         event.messageType = MessageType(event.messageType)
         self.state = self.state.on_event(event)
         return None
+    
+    def client_call_1(self):
+        print("Client call 1")
+        context = Pyro5.api.current_context
+        event = {
+            "type": EventType.APPEND_ENTRIES,
+            "messageType": MessageType.EVENT,
+            "data": {
+                "id": str(uuid.uuid4()),
+                "leader": self.leader,
+                "uri": self.uri,
+                "term": self.term,
+                "client": context.client_sock_addr,
+                "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+                "data": {
+                    "operation": "client_call_1",
+                    "arguments": None,
+                    "success": True
+                },
+            }
+        }
+        self.on_event(event)
+        return True
         
     def init_state(self):
         self.state = StateMachine(self)
@@ -72,7 +98,8 @@ class RaftNode(object):
             node_proxy.on_event(event)
             # print(f"Sent event {event} to {uri}")
         except Pyro5.errors.PyroError as e:
-            # print(f"Error sending vote to {uri}: {e}")
+            print(f"Error sending event to {uri}: {e}")
+            print(f"Event: {event}")
             pass
     
 
