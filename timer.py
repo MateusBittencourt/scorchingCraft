@@ -1,37 +1,44 @@
 import threading
 import time
 
-# This class is a timer that runs asynchronously
-class Timer(threading.Thread):
-    # The constructor takes a timeout and a callback function
-    def __init__(self, timeout, callback):
-        super().__init__()
-        self.timeout = timeout / 1000
+class Timer:
+    def __init__(self, timeout, callback, continuous=False):
+        self.timeout = timeout / 1000  # convert ms to seconds
         self.callback = callback
+        self.continuous = continuous
+        self.timer_thread = None
         self.stop_event = threading.Event()
         self.reset_event = threading.Event()
 
-    # This function is the main loop of the timer
-    def run(self):
+    def _timer_loop(self):
         while not self.stop_event.is_set():
-            # Wait for the timeout or until stop is called
-            is_timeout = not self.reset_event.wait(self.timeout)
-            if is_timeout:
-                try:
-                    self.callback()
-                except Exception as e:
-                    print(f"Error during callback execution: {e}")
-                self.stop()
-            else:
-                # Reset was triggered, clear the event and continue
+            if self.reset_event.wait(self.timeout):
+                # If reset_event is set, clear it for the next iteration
                 self.reset_event.clear()
+            else:
+                # Timeout happened
+                if not self.stop_event.is_set():  # Double-check to avoid race condition
+                    try:
+                        self.callback()
+                    except Exception as e:
+                        print(f"Error during callback execution: {e}")
+                    if not self.continuous:
+                        break  # Exit the loop if not continuous
+        self.timer_thread = None  # Thread has finished, clear the reference
 
-    # This function stops the timer
+    def start(self):
+        if self.timer_thread is not None:
+            # Timer is already running
+            return
+        self.stop_event.clear()  # Ensure stop_event is clear at start
+        self.reset_event.clear()  # Ensure reset_event is clear at start
+        self.timer_thread = threading.Thread(target=self._timer_loop)
+        self.timer_thread.start()
+
     def stop(self):
         self.stop_event.set()
+        # if self.timer_thread is not None:
+        #     self.timer_thread.join()  # Wait for the thread to finish
 
-    # This function resets the timer
     def reset(self):
-        self.stop_event.clear()
         self.reset_event.set()
-        self.run()
